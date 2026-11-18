@@ -567,7 +567,9 @@ func (s *Server) listCommits(w http.ResponseWriter, r *http.Request, owner, repo
 		list = append(list, map[string]any{
 			"sha": oid,
 			"commit": map[string]any{
-				"message":   c.Message,
+				// GitHub strips the commit object's trailing newline from
+				// the message; the kit compares the exact message it sent.
+				"message":   strings.TrimSuffix(c.Message, "\n"),
 				"author":    identJSON(c.Author),
 				"committer": identJSON(c.Committer),
 			},
