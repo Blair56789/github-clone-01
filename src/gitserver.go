@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Git smart HTTP: protocol v2 + v0 upload-pack, v0-only receive-pack.
@@ -398,13 +399,67 @@ func planFetch(repo *Repo, fa fetchArgs) (objects []*Object, boundary, unshallow
 	return objects, boundary, unshallow
 }
 
-// fetchV2 answers a v2 fetch command.
+// singleflight coalesces concurrent identical calls: the first caller runs
+// fn, the rest wait and share its result. (A minimal re-implementation of
+// the standard singleflight pattern; the x/sync package is not vendored.)
+type singleflight struct {
+	mu sync.Mutex
+	m  map[string]*flightCall
+}
+
+type flightCall struct {
+	done chan struct{}
+	out  []byte
+	err  error
+}
+
+func (g *singleflight) do(key string, fn func() ([]byte, error)) ([]byte, error) {
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[string]*flightCall)
+	}
+	if c, ok := g.m[key]; ok {
+		g.mu.Unlock()
+		<-c.done
+		return c.out, c.err
+	}
+	c := &flightCall{done: make(chan struct{})}
+	g.m[key] = c
+	g.mu.Unlock()
+	c.out, c.err = fn()
+	close(c.done)
+	g.mu.Lock()
+	delete(g.m, key)
+	g.mu.Unlock()
+	return c.out, c.err
+}
+
+// fetchV2 answers a v2 fetch command. Concurrent identical fetches share one
+// pack build through singleflight: the clone benchmark fires 50 identical
+// depth-1 clones at once, and building the same 200-commit pack 50 times
+// would serialize on CPU.
 func (s *Server) fetchV2(repo *Repo, args []string) ([]byte, error) {
 	fa := parseFetchArgs(args)
 	if len(fa.wants) == 0 {
 		return nil, fmt.Errorf("fetch with no wants")
 	}
 	key := fmt.Sprintf("fetch|%v|%v|%v|%d|%v|%v", fa.wants, fa.haves, fa.shallow, fa.depth, fa.done, fa.deepenRelative)
+	s.mu.RLock()
+	if cached, ok := repo.fetchCache[key]; ok {
+		s.mu.RUnlock()
+		return cached, nil
+	}
+	version := repo.Version
+	s.mu.RUnlock()
+	flightKey := fmt.Sprintf("%p|%s|%d", repo, key, version)
+	return s.fetchFlight.do(flightKey, func() ([]byte, error) {
+		return s.buildFetchV2(repo, fa, key)
+	})
+}
+
+// buildFetchV2 builds one fetch response, re-checking the cache first (a
+// previous flight may have filled it) and storing under a version guard.
+func (s *Server) buildFetchV2(repo *Repo, fa fetchArgs, key string) ([]byte, error) {
 	s.mu.RLock()
 	if cached, ok := repo.fetchCache[key]; ok {
 		s.mu.RUnlock()

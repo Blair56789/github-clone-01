@@ -295,6 +295,8 @@ type Server struct {
 	shopToken string
 
 	reqSeq uint64 // X-GitHub-Request-Id counter (atomic)
+
+	fetchFlight singleflight // coalesces concurrent identical v2 fetches
 }
 
 func newServer(shopToken string, trialNow time.Time) *Server {
